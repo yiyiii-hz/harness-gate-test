@@ -81,8 +81,81 @@ jobs:
                 f"cache_read: {u.get('cache_read_input_tokens')} output: {u.get('output_tokens')}")
           EOF
 
+  ci:
+    # v0.6 §6.1：预检 → 只按 base 的依赖文件装依赖 → 候选只在断网、无环境变量、非 root 的容器里跑 base 的测试
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 15
+    outputs:
+      exit: ${{ steps.test.outputs.exit }}
+      sha: ${{ steps.test.outputs.sha }}
+      deps_digest: ${{ steps.deps.outputs.digest }}
+    env:
+      # 实时从 Docker Hub 查到的 digest（2026-10-20），固定镜像，防止被替换
+      IMAGE: python:3.12-slim@sha256:a6e34c598f2467ed0e9a8d349809fcd8b5c603269512df273a0bb1784edc11b1
+      BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+    steps:
+      - name: Fetch base and candidate (files only, no code executed)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          W="$RUNNER_TEMP/ci"; mkdir -p "$W"; cd "$W"
+          auth="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          git init -q repo && cd repo
+          git -c http.extraHeader="$auth" fetch -q --depth 50 "https://github.com/$GITHUB_REPOSITORY" "$BASE_SHA" "pull/$PR/head"
+          git worktree add -q --detach ../base "$BASE_SHA"
+          git worktree add -q --detach ../cand "$HEAD_SHA"
+          git diff --name-only "$BASE_SHA...$HEAD_SHA" > ../changed.txt
+          echo "changed files:"; sed 's/^/  /' ../changed.txt
+
+      - name: Precheck (W04, W22)
+        run: |
+          cd "$RUNNER_TEMP/ci"
+          # base 拥有的路径和依赖文件，候选一律不许改（v1 不支持 deps-change）
+          bad=$(grep -E '^(\.github/|\.harness/|tests/)|(^|/)(requirements[^/]*\.txt|pyproject\.toml|setup\.(py|cfg)|Pipfile(\.lock)?|poetry\.lock|package(-lock)?\.json|yarn\.lock|pnpm-lock\.yaml|\.npmrc|pip\.conf|\.pypirc)$' changed.txt || true)
+          if [ -n "$bad" ]; then
+            echo "precheck failed, candidate touched protected files:"; echo "$bad" | sed 's/^/  /'
+            echo "### precheck failed" >> "$GITHUB_STEP_SUMMARY"; echo "$bad" | sed 's/^/- /' >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          # 覆盖测试：用 base 的 tests/ 替换候选的版本
+          rm -rf cand/tests && cp -r base/tests cand/tests
+
+      - name: Install deps from base only
+        id: deps
+        run: |
+          cd "$RUNNER_TEMP/ci"
+          mkdir -p deps && chmod 777 deps
+          echo "digest=$(sha256sum base/requirements.txt | cut -c1-64)" >> "$GITHUB_OUTPUT"
+          # 不挂载候选代码；不传任何环境变量；只读挂载 base 的 requirements.txt
+          docker run --rm --user 65534:65534 -e HOME=/tmp -e PIP_NO_CACHE_DIR=1 \
+            -v "$PWD/base/requirements.txt:/req.txt:ro" -v "$PWD/deps:/deps" "$IMAGE" \
+            python -m pip install --quiet --disable-pip-version-check --no-compile --target /deps -r /req.txt
+          chmod -R a-w deps
+
+      - name: Run base tests on candidate (offline, no env, non-root)
+        id: test
+        run: |
+          cd "$RUNNER_TEMP/ci"
+          echo "sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
+          set +e
+          docker run --rm --network none --user 65534:65534 --read-only --tmpfs /tmp \
+            --cap-drop ALL --security-opt no-new-privileges --pids-limit 256 --memory 1g \
+            -e PYTHONPATH=/deps -e PYTHONDONTWRITEBYTECODE=1 -e HOME=/tmp \
+            -v "$PWD/cand:/w:ro" -v "$PWD/deps:/deps:ro" -w /w "$IMAGE" \
+            timeout 300 python -m unittest discover -s tests -v > out.txt 2>&1
+          code=$?
+          set -e
+          echo "exit=$code" >> "$GITHUB_OUTPUT"
+          head -c 20000 out.txt
+          echo "### trusted-ci exit=$code" >> "$GITHUB_STEP_SUMMARY"
+
   sign:
-    needs: review
+    needs: [review, ci]
     if: always() && github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     environment: signer
@@ -99,6 +172,11 @@ jobs:
           LEDGER_APP_ID: ${{ secrets.LEDGER_APP_ID }}
           LEDGER_APP_KEY: ${{ secrets.LEDGER_APP_KEY }}
           REVIEW_RESULT: ${{ needs.review.result }}
+          CI_RESULT: ${{ needs.ci.result }}
+          CI_EXIT: ${{ needs.ci.outputs.exit }}
+          CI_SHA: ${{ needs.ci.outputs.sha }}
+          DEPS_DIGEST: ${{ needs.ci.outputs.deps_digest }}
+          OWNER: yiyiii-hz
           VERDICT: ${{ needs.review.outputs.verdict }}
           REVIEWED_SHA: ${{ needs.review.outputs.sha }}
           PR: ${{ github.event.pull_request.number }}
@@ -123,6 +201,8 @@ jobs:
 
           # 收集事实；判断全部在下面的 python 里做，任何异常都算 failure
           pr=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR")
+          # 用户本人的 PR（改工作流等）不走派活流程：这里不写任何检查，由用户在电脑上另行处理
+          if [ "$(jq -r .user.login <<<"$pr")" = "$OWNER" ]; then echo "owner PR: not signed by workflow" | tee -a "$GITHUB_STEP_SUMMARY"; exit 0; fi
           head=$(jq -r .head.sha <<<"$pr"); branch=$(jq -r .head.ref <<<"$pr")
           id=$(jq -r '.body // "" | split("\n")[0] | capture("^dispatch_id: (?<id>[0-9]+-g[0-9]+)$").id // ""' <<<"$pr")
           num=${id%%-g*}
@@ -145,6 +225,9 @@ jobs:
               if not cond: problems.append(msg)
           need(e["REVIEW_RESULT"] == "success", f"review job result={e['REVIEW_RESULT']}")
           need(e["VERDICT"] == "pass", f"claude verdict={e['VERDICT'] or 'none'}")
+          need(e["CI_RESULT"] == "success", f"ci job result={e['CI_RESULT']}")
+          need(e["CI_EXIT"] == "0", f"tests exit={e['CI_EXIT'] or 'none'}")
+          need(e["CI_SHA"] == e["HEAD"], "tested sha != current head (superseded)")
           need(e["REVIEWED_SHA"] == e["HEAD"], "reviewed sha != current head (superseded)")
           need(pr.get("user", {}).get("login") == e["GROK_BOT"], "PR not opened by the Grok App")
           need(bool(e["ID"]), "no dispatch_id on first line of PR body")
@@ -163,7 +246,8 @@ jobs:
           assert conclusion in ("success", "failure")
           key = {"repo_id": e["REPO_ID"], "pr": e["PR"], "head": e["HEAD"], "base": pr["base"]["sha"],
                  "dispatch_id": e["ID"], "digest": rc.get("digest"), "workflow_sha": e["GITHUB_WORKFLOW_SHA"],
-                 "run_id": e["GITHUB_RUN_ID"], "claude_cli": "2.1.304", "model": "sonnet"}
+                 "run_id": e["GITHUB_RUN_ID"], "claude_cli": "2.1.304", "model": "sonnet",
+                 "deps_digest": e["DEPS_DIGEST"], "image": "python:3.12-slim@sha256:a6e34c59"}
           print(json.dumps({"conclusion": conclusion, "problems": problems, "key": key}))
           EOF
           conclusion=$(jq -r .conclusion /tmp/decision.json)
