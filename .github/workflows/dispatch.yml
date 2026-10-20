@@ -9,11 +9,6 @@ on:
 
 permissions: {}
 
-# 派活与撤销对同一个 issue 串行执行（W21）
-concurrency:
-  group: issue-${{ github.event.issue.number }}
-  cancel-in-progress: false
-
 env:
   OWNER_ID: "271876985" # yiyiii-hz 的数字 ID
   LEDGER_REPO: yiyiii-hz/harness-ledger-test
@@ -35,6 +30,10 @@ jobs:
     if: github.event_name == 'issues' && github.event.action == 'labeled' && github.event.label.name == 'approved'
     runs-on: ubuntu-latest
     environment: dispatcher
+    # 只串行派活。撤销不加 concurrency：同组排队的旧任务会被新任务顶掉（实测），撤销不能被吞
+    concurrency:
+      group: dispatch-issue-${{ github.event.issue.number }}
+      cancel-in-progress: false
     permissions:
       issues: write
     steps:
