@@ -33,3 +33,10 @@ def stdev(values):
     if not values:
         raise ValueError("values must not be empty")
     return variance(values) ** 0.5
+
+
+def range_(values):
+    """Return the range (maximum minus minimum) of a non-empty list of numbers."""
+    if not values:
+        raise ValueError("values must not be empty")
+    return max(values) - min(values)
