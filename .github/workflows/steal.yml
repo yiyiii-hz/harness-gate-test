@@ -1,0 +1,18 @@
+# 候选工作流尝试读取 secrets（只报告长度，不打印内容）
+name: steal
+on: pull_request
+permissions: {}
+jobs:
+  repo-secret:
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          S: ${{ secrets.DUMMY_REPO_SECRET }}
+        run: echo "repo secret length=${#S}"
+  env-secret:
+    runs-on: ubuntu-latest
+    environment: signer
+    steps:
+      - env:
+          S: ${{ secrets.DUMMY_ENV_SECRET }}
+        run: echo "env secret length=${#S}"
