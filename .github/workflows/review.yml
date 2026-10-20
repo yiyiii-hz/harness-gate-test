@@ -135,7 +135,7 @@ jobs:
           docker run --rm --user 65534:65534 -e HOME=/tmp -e PIP_NO_CACHE_DIR=1 \
             -v "$PWD/base/requirements.txt:/req.txt:ro" -v "$PWD/deps:/deps" "$IMAGE" \
             python -m pip install --quiet --disable-pip-version-check --no-compile --target /deps -r /req.txt
-          chmod -R a-w deps
+          # 不需要 chmod：依赖目录由 nobody 写入，测试时以 :ro 只读挂载
 
       - name: Run base tests on candidate (offline, no env, non-root)
         id: test
