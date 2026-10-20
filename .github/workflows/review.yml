@@ -109,20 +109,32 @@ jobs:
           git -c http.extraHeader="$auth" fetch -q --depth 50 "https://github.com/$GITHUB_REPOSITORY" "$BASE_SHA" "pull/$PR/head"
           git worktree add -q --detach ../base "$BASE_SHA"
           git worktree add -q --detach ../cand "$HEAD_SHA"
-          git diff --name-only "$BASE_SHA...$HEAD_SHA" > ../changed.txt
+          git diff --name-status --no-renames "$BASE_SHA...$HEAD_SHA" > ../changed.txt
           echo "changed files:"; sed 's/^/  /' ../changed.txt
 
       - name: Precheck (W04, W22)
+        id: pre
         run: |
           cd "$RUNNER_TEMP/ci"
-          # base 拥有的路径和依赖文件，候选一律不许改（v1 不支持 deps-change）
-          bad=$(grep -E '^(\.github/|\.harness/|tests/)|(^|/)(requirements[^/]*\.txt|pyproject\.toml|setup\.(py|cfg)|Pipfile(\.lock)?|poetry\.lock|package(-lock)?\.json|yarn\.lock|pnpm-lock\.yaml|\.npmrc|pip\.conf|\.pypirc)$' changed.txt || true)
+          protected='^(\.github/|\.harness/)|(^|/)(requirements[^/]*\.txt|pyproject\.toml|setup\.(py|cfg)|Pipfile(\.lock)?|poetry\.lock|package(-lock)?\.json|yarn\.lock|pnpm-lock\.yaml|\.npmrc|pip\.conf|\.pypirc|sitecustomize\.py|usercustomize\.py)$'
+          bad=""; : > new_tests.txt
+          while IFS=$'\t' read -r st path; do
+            if [[ "$path" =~ $protected ]]; then bad+="$st $path"$'\n'; continue; fi
+            if [[ "$path" == tests/* ]]; then
+              # 已有测试不许改、不许删；只允许新增 tests/test_*.py
+              if [ "$st" = A ] && [[ "$path" =~ ^tests/test_[A-Za-z0-9_]+\.py$ ]]; then echo "$path" >> new_tests.txt
+              else bad+="$st $path"$'\n'; fi
+            fi
+          done < changed.txt
           if [ -n "$bad" ]; then
-            echo "precheck failed, candidate touched protected files:"; echo "$bad" | sed 's/^/  /'
-            echo "### precheck failed" >> "$GITHUB_STEP_SUMMARY"; echo "$bad" | sed 's/^/- /' >> "$GITHUB_STEP_SUMMARY"
+            echo "precheck failed, candidate touched protected files:"; printf '%s' "$bad" | sed 's/^/  /'
+            { echo "### precheck failed"; printf '%s' "$bad" | sed 's/^/- /'; } >> "$GITHUB_STEP_SUMMARY"
             exit 1
           fi
-          # 覆盖测试：用 base 的 tests/ 替换候选的版本
+          # 新增的测试单独放一份（第二次运行用）；候选树里的 tests/ 换成 base 的
+          mkdir -p newtests
+          while read -r f; do cp "cand/$f" newtests/; done < new_tests.txt
+          echo "new tests: $(wc -l < new_tests.txt)"; sed 's/^/  /' new_tests.txt
           rm -rf cand/tests && cp -r base/tests cand/tests
 
       - name: Install deps from base only
@@ -137,22 +149,38 @@ jobs:
             python -m pip install --quiet --disable-pip-version-check --no-compile --target /deps -r /req.txt
           # 不需要 chmod：依赖目录由 nobody 写入，测试时以 :ro 只读挂载
 
-      - name: Run base tests on candidate (offline, no env, non-root)
+      - name: Run tests (offline, no env, non-root, trusted runner)
         id: test
         run: |
           cd "$RUNNER_TEMP/ci"
           echo "sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
+          # $1=代码目录 $2=测试目录 $3=输出文件；运行脚本来自 base，只读挂载
+          run() {
+            docker run --rm --network none --user 65534:65534 --read-only --tmpfs /tmp \
+              --cap-drop ALL --security-opt no-new-privileges --pids-limit 256 --memory 1g \
+              -e PYTHONPATH=/deps -e PYTHONDONTWRITEBYTECODE=1 -e HOME=/tmp \
+              -v "$PWD/$1:/w:ro" -v "$PWD/$2:/t:ro" -v "$PWD/deps:/deps:ro" -v "$PWD/base/.harness:/runner:ro" \
+              -w /tmp "$IMAGE" timeout 300 python -P /runner/run_tests.py /w /t > "$3" 2>&1
+          }
+          # 结果行必须是最后一行，并且由运行脚本打印；只看退出码会被 os._exit(0) 骗过
+          parse() { tail -n 1 "$1" | sed -nE 's/^HARNESS-RESULT ran=([0-9]+) failures=([0-9]+) errors=([0-9]+) skipped=([0-9]+)$/\1 \2 \3 \4/p'; }
           set +e
-          docker run --rm --network none --user 65534:65534 --read-only --tmpfs /tmp \
-            --cap-drop ALL --security-opt no-new-privileges --pids-limit 256 --memory 1g \
-            -e PYTHONPATH=/deps -e PYTHONDONTWRITEBYTECODE=1 -e HOME=/tmp \
-            -v "$PWD/cand:/w:ro" -v "$PWD/deps:/deps:ro" -w /w "$IMAGE" \
-            timeout 300 python -m unittest discover -s tests -v > out.txt 2>&1
-          code=$?
+          run base base/tests baseline.txt; read -r n_base _ <<<"$(parse baseline.txt)"
+          run cand cand/tests run1.txt; code1=$?; read -r ran1 f1 e1 s1 <<<"$(parse run1.txt)"
+          code2=0; ran2=0; f2=0; e2=0; s2=0
+          if [ -s new_tests.txt ]; then run cand newtests run2.txt; code2=$?; read -r ran2 f2 e2 s2 <<<"$(parse run2.txt)"; fi
           set -e
-          echo "exit=$code" >> "$GITHUB_OUTPUT"
-          head -c 20000 out.txt
-          echo "### trusted-ci exit=$code" >> "$GITHUB_STEP_SUMMARY"
+          echo "--- run1: candidate code + base tests"; head -c 15000 run1.txt
+          [ -f run2.txt ] && { echo "--- run2: candidate code + new tests only"; head -c 15000 run2.txt; }
+          ok=1
+          [ -n "$n_base" ] && [ "$n_base" -gt 0 ] || { echo "baseline produced no result line"; ok=0; }
+          [ "$code1" = 0 ] && [ "${ran1:-x}" = "$n_base" ] && [ "$f1$e1$s1" = 000 ] || { echo "run1 failed: exit=$code1 ran=${ran1:-none}/${n_base:-?} f=$f1 e=$e1 s=$s1"; ok=0; }
+          if [ -s new_tests.txt ]; then
+            [ "$code2" = 0 ] && [ "${ran2:-0}" -gt 0 ] && [ "$f2$e2$s2" = 000 ] || { echo "run2 failed: exit=$code2 ran=${ran2:-none} f=$f2 e=$e2 s=$s2"; ok=0; }
+          fi
+          exit_code=$([ $ok = 1 ] && echo 0 || echo 1)
+          echo "exit=$exit_code" >> "$GITHUB_OUTPUT"
+          echo "### trusted-ci exit=$exit_code (base tests ${ran1:-?}/${n_base:-?}, new tests ${ran2})" | tee -a "$GITHUB_STEP_SUMMARY"
 
   sign:
     needs: [review, ci]
