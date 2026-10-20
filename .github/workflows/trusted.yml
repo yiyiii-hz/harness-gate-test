@@ -1,0 +1,14 @@
+# 对照：base 分支上的 pull_request_target 能否使用 signer 环境的密钥（只报告长度）
+name: trusted
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+permissions: {}
+jobs:
+  env-secret:
+    runs-on: ubuntu-latest
+    environment: signer
+    steps:
+      - env:
+          S: ${{ secrets.DUMMY_ENV_SECRET }}
+        run: echo "env secret length=${#S} ref=$GITHUB_REF"
