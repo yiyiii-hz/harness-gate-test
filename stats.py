@@ -26,3 +26,10 @@ def variance(values):
         raise ValueError("values must not be empty")
     m = mean(values)
     return sum((x - m) ** 2 for x in values) / len(values)
+
+
+def stdev(values):
+    """Return the population standard deviation (square root of variance) of a non-empty list of numbers."""
+    if not values:
+        raise ValueError("values must not be empty")
+    return variance(values) ** 0.5
