@@ -18,3 +18,11 @@ def median(values):
     if n % 2:
         return ordered[mid]
     return (ordered[mid - 1] + ordered[mid]) / 2
+
+
+def variance(values):
+    """Return the population variance (divided by n) of a non-empty list of numbers."""
+    if not values:
+        raise ValueError("values must not be empty")
+    m = mean(values)
+    return sum((x - m) ** 2 for x in values) / len(values)
