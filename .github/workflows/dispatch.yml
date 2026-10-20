@@ -1,0 +1,60 @@
+# 实验 2A：派活与撤销批准（W02/W13/W14）。只记录，不真的唤醒 Grok。
+name: dispatch
+
+on:
+  issues:
+    types: [labeled, edited]
+  issue_comment:
+    types: [edited]
+
+permissions: {}
+
+env:
+  OWNER_ID: "271876985" # yiyiii-hz 的数字 ID
+
+jobs:
+  dispatch:
+    if: github.event_name == 'issues' && github.event.action == 'labeled' && github.event.label.name == 'approved'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Gate
+        id: gate
+        env:
+          SENDER_ID: ${{ github.event.sender.id }}
+          SENDER_LOGIN: ${{ github.event.sender.login }}
+          ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          echo "sender=$SENDER_LOGIN ($SENDER_ID) run_attempt=$ATTEMPT"
+          if [ "$ATTEMPT" != "1" ]; then echo "decision=blocked-rerun" >> "$GITHUB_OUTPUT"; exit 0; fi
+          if [ "$SENDER_ID" != "$OWNER_ID" ]; then echo "decision=ignored-sender" >> "$GITHUB_OUTPUT"; exit 0; fi
+          echo "decision=would-wake" >> "$GITHUB_OUTPUT"
+      - name: Snapshot comment
+        if: steps.gate.outputs.decision == 'would-wake'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TITLE: ${{ github.event.issue.title }}
+          BODY: ${{ github.event.issue.body }}
+        run: |
+          digest=$(printf '%s\n%s' "$TITLE" "$BODY" | sha256sum | cut -d' ' -f1)
+          gh api repos/${{ github.repository }}/issues/${{ github.event.issue.number }}/comments \
+            -f body="snapshot sha256=$digest run=${{ github.run_id }}" --jq '.id'
+      - name: Record
+        env:
+          DECISION: ${{ steps.gate.outputs.decision }}
+        run: echo "decision=$DECISION" | tee -a "$GITHUB_STEP_SUMMARY"
+
+  revoke:
+    if: (github.event_name == 'issues' && github.event.action == 'edited') || github.event_name == 'issue_comment'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Remove approved label
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NUM: ${{ github.event.issue.number }}
+        run: |
+          gh api -X DELETE repos/${{ github.repository }}/issues/$NUM/labels/approved || echo "label not present"
+          echo "revoked approval on #$NUM (${{ github.event_name }})" | tee -a "$GITHUB_STEP_SUMMARY"
