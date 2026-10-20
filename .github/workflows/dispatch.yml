@@ -1,60 +1,150 @@
-# 实验 2A：派活与撤销批准（W02/W13/W14）。只记录，不真的唤醒 Grok。
+# v0.6 派活与撤销（§5.2–§5.4）。批准的权威记录在账本仓库；issue 评论只用于展示。
 name: dispatch
 
 on:
   issues:
-    types: [labeled, edited]
+    types: [labeled, edited, reopened]
   issue_comment:
-    types: [edited]
+    types: [edited, deleted]
 
 permissions: {}
 
+# 派活与撤销对同一个 issue 串行执行（W21）
+concurrency:
+  group: issue-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
 env:
   OWNER_ID: "271876985" # yiyiii-hz 的数字 ID
+  LEDGER_REPO: yiyiii-hz/harness-ledger-test
+  # 用账本 App 私钥换账本仓库的 installation token；不用任何 Action，私钥不落盘
+  LEDGER_TOKEN_FN: |
+    ledger_token() {
+      b64() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+      local now h p jwt inst
+      now=$(date +%s)
+      h=$(printf '{"alg":"RS256","typ":"JWT"}' | b64)
+      p=$(printf '{"iat":%d,"exp":%d,"iss":"%s"}' $((now - 60)) $((now + 540)) "$APP_ID" | b64)
+      jwt="$h.$p.$(printf '%s.%s' "$h" "$p" | openssl dgst -sha256 -sign <(printf '%s\n' "$APP_KEY") | b64)"
+      inst=$(curl -fsS --retry 3 -H "Authorization: Bearer $jwt" "https://api.github.com/repos/$LEDGER_REPO/installation" | jq -r .id)
+      curl -fsS --retry 3 -X POST -H "Authorization: Bearer $jwt" "https://api.github.com/app/installations/$inst/access_tokens" | jq -r .token
+    }
 
 jobs:
   dispatch:
     if: github.event_name == 'issues' && github.event.action == 'labeled' && github.event.label.name == 'approved'
     runs-on: ubuntu-latest
+    environment: dispatcher
     permissions:
       issues: write
     steps:
       - name: Gate
         id: gate
         env:
-          SENDER_ID: ${{ github.event.sender.id }}
-          SENDER_LOGIN: ${{ github.event.sender.login }}
-          ATTEMPT: ${{ github.run_attempt }}
-        run: |
-          echo "sender=$SENDER_LOGIN ($SENDER_ID) run_attempt=$ATTEMPT"
-          if [ "$ATTEMPT" != "1" ]; then echo "decision=blocked-rerun" >> "$GITHUB_OUTPUT"; exit 0; fi
-          if [ "$SENDER_ID" != "$OWNER_ID" ]; then echo "decision=ignored-sender" >> "$GITHUB_OUTPUT"; exit 0; fi
-          echo "decision=would-wake" >> "$GITHUB_OUTPUT"
-      - name: Snapshot comment
-        if: steps.gate.outputs.decision == 'would-wake'
-        env:
           GH_TOKEN: ${{ github.token }}
-          TITLE: ${{ github.event.issue.title }}
-          BODY: ${{ github.event.issue.body }}
+          SENDER_ID: ${{ github.event.sender.id }}
+          SENDER_TYPE: ${{ github.event.sender.type }}
+          ATTEMPT: ${{ github.run_attempt }}
+          NUM: ${{ github.event.issue.number }}
+          EV_TITLE: ${{ github.event.issue.title }}
+          EV_BODY: ${{ github.event.issue.body }}
         run: |
-          digest=$(printf '%s\n%s' "$TITLE" "$BODY" | sha256sum | cut -d' ' -f1)
-          gh api repos/${{ github.repository }}/issues/${{ github.event.issue.number }}/comments \
-            -f body="snapshot sha256=$digest run=${{ github.run_id }}" --jq '.id'
-      - name: Record
-        env:
-          DECISION: ${{ steps.gate.outputs.decision }}
-        run: echo "decision=$DECISION" | tee -a "$GITHUB_STEP_SUMMARY"
+          decide() { echo "decision=$1" >> "$GITHUB_OUTPUT"; echo "decision=$1" | tee -a "$GITHUB_STEP_SUMMARY"; exit 0; }
+          [ "$ATTEMPT" = "1" ] || decide blocked-rerun
+          [ "$SENDER_ID" = "$OWNER_ID" ] && [ "$SENDER_TYPE" = "User" ] || decide ignored-sender
+          cur=$(gh api "repos/$GITHUB_REPOSITORY/issues/$NUM")
+          [ "$(jq -r .state <<<"$cur")" = open ] || decide not-open
+          [ "$(jq -r .title <<<"$cur")" = "$EV_TITLE" ] && [ "$(jq -r '.body // ""' <<<"$cur")" = "$EV_BODY" ] || decide changed-since-label
+          node_id=$(jq -r .node_id <<<"$cur")
+          digest=$(printf '%s\n%s\n%s' "$node_id" "$EV_TITLE" "$EV_BODY" | sha256sum | cut -c1-64)
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "decision=ok" >> "$GITHUB_OUTPUT"
 
-  revoke:
-    if: (github.event_name == 'issues' && github.event.action == 'edited') || github.event_name == 'issue_comment'
-    runs-on: ubuntu-latest
-    permissions:
-      issues: write
-    steps:
-      - name: Remove approved label
+      - name: Claim in ledger
+        id: claim
+        if: steps.gate.outputs.decision == 'ok'
+        env:
+          APP_ID: ${{ secrets.LEDGER_APP_ID }}
+          APP_KEY: ${{ secrets.LEDGER_APP_KEY }}
+          DIGEST: ${{ steps.gate.outputs.digest }}
+          NUM: ${{ github.event.issue.number }}
+          REPO_ID: ${{ github.repository_id }}
+          EV_TITLE: ${{ github.event.issue.title }}
+          EV_BODY: ${{ github.event.issue.body }}
+          EVENT_ID: ${{ github.event.issue.updated_at }}
+        run: |
+          eval "$LEDGER_TOKEN_FN"; T=$(ledger_token); echo "::add-mask::$T"
+          L() { curl -sS --retry 3 -H "Authorization: Bearer $T" -H "Accept: application/vnd.github+json" "$@"; }
+          base=$(L "https://api.github.com/repos/$LEDGER_REPO/git/ref/heads/main" | jq -r .object.sha)
+          ref="refs/claims/$REPO_ID/$NUM/${DIGEST:0:12}"
+          code=$(L -o /tmp/claim.json -w '%{http_code}' -X POST "https://api.github.com/repos/$LEDGER_REPO/git/refs" \
+                   -d "$(jq -n --arg ref "$ref" --arg sha "$base" '{ref:$ref,sha:$sha}')")
+          if [ "$code" = 422 ]; then
+            echo "decision=already-claimed" | tee -a "$GITHUB_STEP_SUMMARY"; echo "result=already-claimed" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          [ "$code" = 201 ] || { echo "claim failed: HTTP $code"; exit 1; }
+          gen=$(L "https://api.github.com/repos/$LEDGER_REPO/git/matching-refs/claims/$REPO_ID/$NUM/" | jq length)
+          id="$NUM-g$gen"
+          receipt=$(jq -n --arg id "$id" --arg digest "$DIGEST" --arg ref "$ref" --arg title "$EV_TITLE" --arg body "$EV_BODY" \
+                      --arg run "$GITHUB_RUN_ID" --arg owner "$OWNER_ID" --arg at "$EVENT_ID" \
+                      '{dispatch_id:$id,digest:$digest,claim_ref:$ref,title:$title,body:$body,approver_id:$owner,issue_updated_at:$at,run_id:$run}')
+          L -X PUT "https://api.github.com/repos/$LEDGER_REPO/contents/dispatch/$id.json" \
+            -d "$(jq -n --arg m "dispatch $id" --arg c "$(printf '%s' "$receipt" | base64 -w0)" '{message:$m,content:$c}')" > /dev/null
+          echo "dispatch_id=$id" >> "$GITHUB_OUTPUT"; echo "result=claimed" >> "$GITHUB_OUTPUT"
+          echo "decision=claimed dispatch_id=$id" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Display snapshot
+        if: steps.claim.outputs.result == 'claimed'
         env:
           GH_TOKEN: ${{ github.token }}
           NUM: ${{ github.event.issue.number }}
+          ID: ${{ steps.claim.outputs.dispatch_id }}
+          DIGEST: ${{ steps.gate.outputs.digest }}
         run: |
-          gh api -X DELETE repos/${{ github.repository }}/issues/$NUM/labels/approved || echo "label not present"
-          echo "revoked approval on #$NUM (${{ github.event_name }})" | tee -a "$GITHUB_STEP_SUMMARY"
+          gh api "repos/$GITHUB_REPOSITORY/issues/$NUM/comments" \
+            -f body="harness:snapshot dispatch_id=$ID digest=${DIGEST:0:12} ledger=$LEDGER_REPO（展示用；权威记录在账本）" --jq .id
+
+      - name: Wake Grok
+        if: steps.claim.outputs.result == 'claimed'
+        env:
+          WEBHOOK_URL: ${{ secrets.GROK_WEBHOOK_URL }}
+          WEBHOOK_TOKEN: ${{ secrets.GROK_WEBHOOK_TOKEN }}
+          NUM: ${{ github.event.issue.number }}
+          ID: ${{ steps.claim.outputs.dispatch_id }}
+        run: |
+          if [ -z "$WEBHOOK_URL" ]; then echo "wake=skipped (no webhook configured)" | tee -a "$GITHUB_STEP_SUMMARY"; exit 0; fi
+          payload=$(jq -n --arg repo "$GITHUB_REPOSITORY" --argjson issue "$NUM" --arg id "$ID" '{repo:$repo,issue:$issue,dispatch_id:$id}')
+          code=$(printf 'header = "Authorization: Bearer %s"\n' "$WEBHOOK_TOKEN" | \
+                 curl -sS -o /dev/null -w '%{http_code}' --max-time 20 -K - -H "Content-Type: application/json" -d "$payload" "$WEBHOOK_URL" || echo 000)
+          echo "wake=HTTP $code" | tee -a "$GITHUB_STEP_SUMMARY"
+          case "$code" in 2*) ;; *) echo "::warning::wake_unknown (HTTP $code), 不自动重试" ;; esac
+
+  revoke:
+    if: (github.event_name == 'issues' && (github.event.action == 'edited' || github.event.action == 'reopened')) || github.event_name == 'issue_comment'
+    runs-on: ubuntu-latest
+    environment: dispatcher
+    permissions:
+      issues: write
+    steps:
+      - name: Revoke
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APP_ID: ${{ secrets.LEDGER_APP_ID }}
+          APP_KEY: ${{ secrets.LEDGER_APP_KEY }}
+          NUM: ${{ github.event.issue.number }}
+          REPO_ID: ${{ github.repository_id }}
+          EVENT: ${{ github.event_name }}.${{ github.event.action }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+        run: |
+          # 评论事件只在对象是快照评论时撤销
+          if [ "${EVENT%%.*}" = issue_comment ] && [[ "$COMMENT_BODY" != harness:snapshot* ]]; then echo "not a snapshot comment"; exit 0; fi
+          eval "$LEDGER_TOKEN_FN"; T=$(ledger_token); echo "::add-mask::$T"
+          L() { curl -sS --retry 3 -H "Authorization: Bearer $T" -H "Accept: application/vnd.github+json" "$@"; }
+          for ref in $(L "https://api.github.com/repos/$LEDGER_REPO/git/matching-refs/claims/$REPO_ID/$NUM/" | jq -r '.[].ref'); do
+            d=${ref##*/}; f="revoke/$REPO_ID-$NUM-$d.json"
+            body=$(jq -n --arg ref "$ref" --arg ev "$EVENT" --arg run "$GITHUB_RUN_ID" '{claim_ref:$ref,event:$ev,run_id:$run}')
+            code=$(L -o /dev/null -w '%{http_code}' -X PUT "https://api.github.com/repos/$LEDGER_REPO/contents/$f" \
+                     -d "$(jq -n --arg m "revoke $d" --arg c "$(printf '%s' "$body" | base64 -w0)" '{message:$m,content:$c}')")
+            echo "revoke $d: HTTP $code (422 = 已撤销过)" | tee -a "$GITHUB_STEP_SUMMARY"
+          done
+          gh api -X DELETE "repos/$GITHUB_REPOSITORY/issues/$NUM/labels/approved" >/dev/null 2>&1 && echo "approved removed" || echo "approved not present"
